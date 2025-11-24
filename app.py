@@ -1,97 +1,63 @@
-# app.py
-import os, io, zipfile, tempfile, base64
+import os, io, base64
 import numpy as np
-from PIL import Image
-
-import tensorflow as tf
-from tensorflow.keras.layers import Input, GlobalAveragePooling2D, Dense
-from tensorflow.keras import Model
-
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ================== إعدادات أساسية ==================
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
+from PIL import Image, ImageOps
+
+# محاولة تفعيل دعم AVIF لو البلَغن موجود
+try:
+    import pillow_avif  # noqa: F401
+except Exception:
+    pass
+
+
+# ==============================
+# CONFIG
+# ==============================
 IMG_SIZE = (240, 240)
 CLASS_NAMES = ["MEL","NV","BCC","AKIEC","BKL","DF","VASC"]
 
-# نخلي الحدود مثل ما في كود كولاب بالضبط
-MOLE_THRESHOLD = 0.99      # نفس: if mole_pred[0][0] > 0.99
-ABNORMAL_THRESHOLD = 0.50  # نفس: if binary_pred[0][0] > 0.5
+MOLE_THRESHOLD = 0.99
+ABNORMAL_THRESHOLD = 0.50
 
-API_KEY = ""  # خليه فاضي = بدون حماية
+API_KEY = ""
 
-# مسارات الملفات
-WEIGHTS_PATH   = os.getenv("WEIGHTS_PATH", "models/model.weights.h5")
 KERAS_PRIMARY  = os.getenv("KERAS_PRIMARY", "models/api_export.keras")
 KERAS_FALLBACK = os.getenv("KERAS_FALLBACK", "models/SkinMeleo_model.keras")
 
-# ================== أدوات الموديل ==================
-def build_model():
-    """
-    نفس معمارية الموديل في كولاب:
-    EfficientNetB1 + GlobalAveragePooling2D + 3 مخارج.
-    """
-    base = tf.keras.applications.EfficientNetB1(
-        input_shape=IMG_SIZE + (3,),
-        include_top=False,
-        weights=None          # الوزنات بنحمّلها من ملفكم أنتم
-    )
-    base.trainable = False
 
-    inp = Input(shape=IMG_SIZE + (3,))
-    x = base(inp, training=False)
-    x = GlobalAveragePooling2D()(x)
-
-    mole   = Dense(1, activation="sigmoid", name="mole_presence_output")(x)
-    binary = Dense(1, activation="sigmoid", name="binary_output")(x)
-    ctype  = Dense(7, activation="softmax",  name="cancer_type_output")(x)
-
-    model = Model(inp, [mole, binary, ctype])
-    return model
-
-def ensure_weights_file() -> str:
-    """
-    يرجع مسار model.weights.h5
-    لو مو موجود، يحاول يستخرجه من api_export.keras أو SkinMeleo_model.keras كـ zip.
-    """
-    if os.path.exists(WEIGHTS_PATH):
-        return WEIGHTS_PATH
-
-    for keras_path in (KERAS_PRIMARY, KERAS_FALLBACK):
-        if os.path.exists(keras_path) and zipfile.is_zipfile(keras_path):
-            with zipfile.ZipFile(keras_path, "r") as z:
-                cand = [n for n in z.namelist() if n.endswith("model.weights.h5")]
-                if cand:
-                    tmpdir = tempfile.mkdtemp(prefix="weights_")
-                    out = os.path.join(tmpdir, "model.weights.h5")
-                    with z.open(cand[0]) as src, open(out, "wb") as dst:
-                        dst.write(src.read())
-                    print(f"✅ extracted weights from {keras_path}")
-                    return out
-
-    raise RuntimeError(
-        "لا يوجد models/model.weights.h5 ولا قدرت أستخرجه من أي .keras داخل models/."
-    )
-
+# ==============================
+# PREPROCESS (مطابق كولاب 1:1)
+# ==============================
 def preprocess_rgb(file_bytes: bytes) -> np.ndarray:
-    """
-    نفس المعالجة اللي في كولاب:
-    - تحويل الصورة إلى RGB
-    - تغيير الحجم إلى 240x240
-    - efficientnet.preprocess_input
-    """
-    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    img = img.resize(IMG_SIZE)
-    arr = np.asarray(img, dtype=np.float32)
-    arr = tf.keras.applications.efficientnet.preprocess_input(arr)
-    return np.expand_dims(arr, 0)  # (1,240,240,3)
+    # نفس load_img في كولاب: فتح عبر PIL
+    img = Image.open(io.BytesIO(file_bytes))
 
+    # نفس كيراس: تصحيح اتجاه الصورة لو فيها EXIF
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    # نفس default في keras load_img: resize بـ NEAREST
+    img = img.resize(IMG_SIZE, resample=Image.NEAREST)
+
+    # نفس img_to_array: float32 بدون /255
+    arr = np.asarray(img, dtype=np.float32)
+
+    # نفس preprocess_input حق EfficientNet
+    arr = tf.keras.applications.efficientnet.preprocess_input(arr)
+
+    return np.expand_dims(arr, 0)
+
+
+# ==============================
+# AUTH
+# ==============================
 def authorize(auth_header: str | None):
-    """
-    حماية بالمفتاح (معطلة لو API_KEY = '').
-    """
     if not API_KEY:
         return
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -100,85 +66,101 @@ def authorize(auth_header: str | None):
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ================== تحميل الموديل مرة واحدة ==================
-weights_file = ensure_weights_file()
-model = build_model()
-try:
-    model.load_weights(weights_file)
-except Exception:
-    # في حال اختلاف أسماء بسيطة
-    model.load_weights(weights_file, by_name=True, skip_mismatch=True)
 
-# جولة dummy للتأكد
+# ==============================
+# LOAD MODEL (نفس الملف نفسه بدون rebuild)
+# ==============================
+KERAS_PATH = KERAS_PRIMARY if os.path.exists(KERAS_PRIMARY) else KERAS_FALLBACK
+if not os.path.exists(KERAS_PATH):
+    raise RuntimeError("لم يتم العثور على ملف .keras داخل models/")
+
+model = load_model(KERAS_PATH, compile=False)
+
+# warmup
 _ = model(tf.zeros((1,) + IMG_SIZE + (3,)))
-print("✅ Model ready. Input:", model.input_shape)
+print("✅ Loaded model from:", KERAS_PATH)
+print("✅ Outputs:", [o.name for o in model.outputs])
 
-# ================== تعريف FastAPI ==================
-app = FastAPI(title="SkinMeleo API", version="1.0.2")
 
+# ==============================
+# FASTAPI
+# ==============================
+app = FastAPI(title="SkinMeleo API", version="1.0.7")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 class Base64Body(BaseModel):
     image_base64: str
 
+
+# ==============================
+# INFERENCE CORE
+# ==============================
+def run_inference_core(x: np.ndarray, debug: int = 0):
+    preds = model.predict(x, verbose=0)
+
+    # ---- دعم رأسين أو ثلاثة
+    if isinstance(preds, (list, tuple)) and len(preds) == 3:
+        mole_pred, binary_pred, type_pred = preds
+        mole_score = float(mole_pred[0][0])
+        image_suit = mole_score > MOLE_THRESHOLD
+    elif isinstance(preds, (list, tuple)) and len(preds) == 2:
+        binary_pred, type_pred = preds
+        mole_score = 1.0
+        image_suit = True  # ما عندك mole head أصلاً
+    else:
+        raise RuntimeError(f"Unexpected model outputs: {type(preds)} / len={len(preds) if isinstance(preds,(list,tuple)) else 'N/A'}")
+
+    # ---- Scores
+    bin_score = float(binary_pred[0][0])
+    type_scores = type_pred[0]
+    pred_type = CLASS_NAMES[int(np.argmax(type_scores))]
+
+    # ---- منطق التماسك: إذا النوع خبيث اعتبر Abnormal حتى لو bin منخفض
+    malignant_types = {"MEL", "BCC", "AKIEC"}
+    is_abnormal = (bin_score > ABNORMAL_THRESHOLD) or (pred_type in malignant_types)
+
+    # ---- Debug output
+    if debug:
+        return {
+            "Image_Suitability": bool(image_suit),
+            "IsAbnormal": bool(is_abnormal) if image_suit else False,
+            "Predicted_Type": pred_type if image_suit else "",
+            "Scores": {
+                "mole": mole_score,
+                "binary": bin_score,
+                "types": {CLASS_NAMES[i]: float(type_scores[i]) for i in range(len(CLASS_NAMES))}
+            }
+        }
+
+    # ---- Normal output
+    if not image_suit:
+        return {
+            "Image_Suitability": False,
+            "IsAbnormal": False,
+            "Predicted_Type": ""
+        }
+
+    return {
+        "Image_Suitability": True,
+        "IsAbnormal": bool(is_abnormal),
+        "Predicted_Type": pred_type
+    }
+
+
+
+
+# ==============================
+# ROUTES
+# ==============================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ============= دالة مساعدة: نفس منطق كولاب بالضبط لكن راجع JSON =============
-def run_inference_core(x: np.ndarray, debug: int = 0):
-    """
-    تشغّل model.predict وتطبّق نفس منطق كود كولاب:
 
-    - mole_pred[0][0] > 0.99  → صورة مناسبة + فيها شامة واضحة
-    - binary_pred[0][0] > 0.5 → خبيثة (Malignant)
-    - Predicted_Type          → argmax(type_pred) لو الصورة suitable
-    """
-    mole_pred, binary_pred, type_pred = model.predict(x, verbose=0)
-
-    mole_score   = float(mole_pred[0][0])
-    binary_score = float(binary_pred[0][0])
-    type_scores  = type_pred[0]  # shape (7,)
-
-    image_suit = mole_score > MOLE_THRESHOLD
-    is_abnormal = binary_score > ABNORMAL_THRESHOLD
-
-    # حالة debug: نرجع كل شيء + الدرجات
-    if debug:
-        return {
-            "IsAbnormal": is_abnormal if image_suit else False,
-            "Image_Suitability": image_suit,
-            "Predicted_Type": CLASS_NAMES[int(np.argmax(type_scores))] if image_suit else "",
-            "scores": {
-                "mole": mole_score,
-                "binary": binary_score,
-                "types": {CLASS_NAMES[i]: float(type_scores[i]) for i in range(7)},
-            }
-        }
-
-    # نفس منطق كولاب: إذا ما تعدّى حد الشامة → نعتبر الصورة غير مناسبة
-    if not image_suit:
-        return {
-            "IsAbnormal": False,
-            "Image_Suitability": False,
-            "Predicted_Type": ""
-        }
-
-    # suitable: نرجّع النوع + ابنورمال زي كود كولاب
-    predicted_type = CLASS_NAMES[int(np.argmax(type_scores))]
-    return {
-        "IsAbnormal": is_abnormal,
-        "Image_Suitability": True,
-        "Predicted_Type": predicted_type
-    }
-
-# ================== /predict (multipart image) ==================
 @app.post("/predict")
 async def predict(
     image: UploadFile = File(...),
@@ -186,14 +168,11 @@ async def predict(
     debug: int = Query(0)
 ):
     authorize(authorization)
-
     data = await image.read()
     x = preprocess_rgb(data)
+    return JSONResponse(run_inference_core(x, debug=debug))
 
-    result = run_inference_core(x, debug=debug)
-    return JSONResponse(result)
 
-# ================== /predict_base64 ==================
 @app.post("/predict_base64")
 def predict_base64(
     body: Base64Body,
@@ -201,12 +180,10 @@ def predict_base64(
     debug: int = Query(0)
 ):
     authorize(authorization)
-
     try:
         raw = base64.b64decode(body.image_base64, validate=True)
     except Exception:
         raise HTTPException(status_code=400, detail="image_base64 غير صالح")
 
     x = preprocess_rgb(raw)
-    result = run_inference_core(x, debug=debug)
-    return JSONResponse(result)
+    return JSONResponse(run_inference_core(x, debug=debug))
